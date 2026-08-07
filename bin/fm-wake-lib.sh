@@ -16,6 +16,12 @@ FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 # confirm and 0.5s attach polls, and forking uname per call is a measurable cost on
 # the platform (Git Bash/MSYS) that already pays the highest fork price.
 _FM_UNAME=$(uname 2>/dev/null || echo unknown)
+# MSYS2/Cygwin: default symlink mode silently creates directory copies instead
+# of real symlinks, breaking the ln-s-based lock protocol.  winsymlinks:lnk uses
+# .lnk shortcut files that MSYS2 exposes as proper POSIX symlinks.
+case "${OSTYPE:-}" in cygwin*|msys*)
+  export MSYS="${MSYS:+$MSYS }winsymlinks:lnk"
+esac
 mkdir -p "$STATE"
 
 # Most wake-library consumers need only queue and lock primitives, including
