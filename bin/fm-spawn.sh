@@ -347,11 +347,10 @@
 #   and its operator contract. Resolve it with bin/fm-exclude-tools-lib.sh
 #   before provisioning; __PIEXCLUDE__ below owns the Pi launch substitution.
 # Worker account pin (config/claude-account, config/pi-account):
-#   Opt-in. With no file, a Claude or Pi launch is unchanged: Claude still
-#   receives this process's own CLAUDE_CONFIG_DIR when it is set, and Pi the
-#   destination pane's ambient account. A present file pins every launch of
-#   that runner from this home - ship, scout, local secondmate, raw Claude
-#   command, and relaunch - to the declared account root, and the spawn
+#   Opt-in. With no file, a Claude launch is unchanged: it still receives this
+#   process's own CLAUDE_CONFIG_DIR when it is set. A present file pins every
+#   launch of that runner from this home - ship, scout, local secondmate, raw
+#   Claude command, and relaunch - to the declared account root, and the spawn
 #   refuses before any endpoint, worktree, or record exists when the file is
 #   malformed, the root is unusable, or the runner's own check says it is not
 #   signed in. A pinned Claude launch sheds the environment credentials Claude
@@ -361,6 +360,16 @@
 #   account_provider=) in the task record and on the spawned line. A local
 #   secondmate reads this launching home's file; pins are never inherited.
 #   bin/fm-worker-account-lib.sh owns parsing, the check, and the shed list.
+# Pi crew/scout runtime root:
+#   Every Pi or pi-signed ship/scout launch (fresh or relaunch) receives its
+#   own PI_CODING_AGENT_DIR under state/<task-id>.pi-agent. The directory is
+#   refreshed idempotently at spawn from the selected source root (pinned
+#   config/pi-account root, else PI_CODING_AGENT_DIR, else ~/.pi/agent) by
+#   copying auth.json and common runtime files, then writing a models.json
+#   overlay that sets github-copilot modelOverrides contextWindow for six
+#   Firstmate-owned worker models. This is a compaction threshold input rather
+#   than a hard provider limit. The cap is FM_PI_CREW_CONTEXT_WINDOW_CAP,
+#   default 272000. Secondmate Pi launches are unchanged.
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
 #     __BRIEF__    absolute path to data/<task-id>/brief.md
 #     __CLAUDEPERMFLAG__ the claude permission flag selected by config/claude-permission-mode
@@ -557,6 +566,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+
+FM_PI_CREW_CONTEXT_WINDOW_CAP=${FM_PI_CREW_CONTEXT_WINDOW_CAP:-272000}
 # shellcheck source=bin/fm-config-inherit-lib.sh
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-exclude-tools-lib.sh
@@ -2498,6 +2509,102 @@ fi
 
 secondmate_registry_value() {
   secondmate_registry_field "$DATA/secondmates.md" "$1" "$2"
+}
+
+pi_crew_agent_source_root() {
+  local root=
+  if [ -n "$WORKER_ACCOUNT_ROOT" ]; then
+    root=$WORKER_ACCOUNT_ROOT
+  elif [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+    root=$PI_CODING_AGENT_DIR
+  else
+    root="${HOME:?HOME is required for the default Pi worker source root}/.pi/agent"
+  fi
+  if [ ! -d "$root" ] || [ ! -r "$root" ] || [ ! -x "$root" ]; then
+    echo "error: Pi worker source root is not a readable, searchable directory: $root" >&2
+    return 1
+  fi
+  printf '%s\n' "$root"
+}
+
+pi_crew_copy_file_if_present() {
+  local source=$1 destination=$2
+  if [ ! -e "$source" ]; then
+    return 0
+  fi
+  if [ ! -f "$source" ] || [ ! -r "$source" ]; then
+    echo "error: expected a readable regular file while preparing the Pi worker runtime root: $source" >&2
+    return 1
+  fi
+  cp "$source" "$destination"
+  chmod 600 "$destination" 2>/dev/null || true
+}
+
+pi_crew_write_models_overlay() {
+  local source_models=${1:-} destination_models=$2 cap=$3
+  local tmp
+  tmp="$destination_models.tmp.$$"
+  if [ -n "$source_models" ]; then
+    if [ ! -f "$source_models" ] || [ ! -r "$source_models" ]; then
+      echo "error: expected a readable regular models.json while preparing the Pi worker runtime root: $source_models" >&2
+      return 1
+    fi
+    jq -c --argjson cap "$cap" '
+      def object_or_empty: if type == "object" then . else {} end;
+      object_or_empty
+      | .providers = ((.providers // {}) | object_or_empty)
+      | .providers["github-copilot"] = ((.providers["github-copilot"] // {}) | object_or_empty)
+      | .providers["github-copilot"].modelOverrides = ((.providers["github-copilot"].modelOverrides // {}) | object_or_empty)
+      | reduce ["gpt-6-luna","gpt-5.3-codex","gemini-3.8-flash","claude-sonnet-5.5","grok-4.7","gpt-6.1-sol"][] as $model
+          (.;
+            .providers["github-copilot"].modelOverrides[$model] =
+              ((.providers["github-copilot"].modelOverrides[$model] // {}) | object_or_empty | .contextWindow = $cap)
+          )
+    ' "$source_models" >"$tmp" || {
+      echo "error: could not parse or update $source_models while preparing the Pi worker runtime root" >&2
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  else
+    jq -cn --argjson cap "$cap" '
+      {
+        providers: {
+          "github-copilot": {
+            modelOverrides: {
+              "gpt-6-luna": {contextWindow: $cap},
+              "gpt-5.3-codex": {contextWindow: $cap},
+              "gemini-3.8-flash": {contextWindow: $cap},
+              "claude-sonnet-5.5": {contextWindow: $cap},
+              "grok-4.7": {contextWindow: $cap},
+              "gpt-6.1-sol": {contextWindow: $cap}
+            }
+          }
+        }
+      }
+    ' >"$tmp" || {
+      echo "error: could not build the Pi worker models.json overlay" >&2
+      rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  fi
+  mv "$tmp" "$destination_models"
+  chmod 600 "$destination_models" 2>/dev/null || true
+}
+
+pi_crew_prepare_agent_dir() {
+  local state_real=$1 id=$2 source_root=$3 cap=$4
+  local target source_models=
+  target="$state_real/$id.pi-agent"
+  mkdir -p "$target"
+  pi_crew_copy_file_if_present "$source_root/auth.json" "$target/auth.json" || return 1
+  pi_crew_copy_file_if_present "$source_root/trust.json" "$target/trust.json" || return 1
+  pi_crew_copy_file_if_present "$source_root/mcp.json" "$target/mcp.json" || return 1
+  pi_crew_copy_file_if_present "$source_root/models-store.json" "$target/models-store.json" || return 1
+  if [ -e "$source_root/models.json" ]; then
+    source_models="$source_root/models.json"
+  fi
+  pi_crew_write_models_overlay "$source_models" "$target/models.json" "$cap" || return 1
+  printf '%s\n' "$target"
 }
 
 resolve_kimi_binary() {
@@ -5270,6 +5377,11 @@ esac
 # A home's worker account pin replaces that forwarding: the launch names the
 # pinned root (or unsets the variable for the ordinary Claude account) and
 # sheds the environment credentials Claude ranks above the root's login.
+PI_CREW_AGENT_DIR=
+if [ "$KIND" != secondmate ] && { [ "$HARNESS" = pi ] || [ "$HARNESS" = pi-signed ]; }; then
+  PI_CREW_SOURCE_ROOT=$(pi_crew_agent_source_root) || exit 1
+  PI_CREW_AGENT_DIR=$(pi_crew_prepare_agent_dir "$STATE_REAL" "$ID" "$PI_CREW_SOURCE_ROOT" "$FM_PI_CREW_CONTEXT_WINDOW_CAP") || exit 1
+fi
 if [ -n "$WORKER_ACCOUNT" ]; then
   case "$HARNESS" in
   claude)
@@ -5280,11 +5392,16 @@ if [ -n "$WORKER_ACCOUNT" ]; then
     fi
     ;;
   pi | pi-signed)
-    LAUNCH="PI_CODING_AGENT_DIR=$(shell_quote "$WORKER_ACCOUNT_ROOT") $LAUNCH"
+    if [ "$KIND" = secondmate ]; then
+      LAUNCH="PI_CODING_AGENT_DIR=$(shell_quote "$WORKER_ACCOUNT_ROOT") $LAUNCH"
+    fi
     ;;
   esac
 elif [ "$HARNESS" = claude ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
   LAUNCH="CLAUDE_CONFIG_DIR=$(shell_quote "$CLAUDE_CONFIG_DIR") $LAUNCH"
+fi
+if [ -n "$PI_CREW_AGENT_DIR" ]; then
+  LAUNCH="PI_CODING_AGENT_DIR=$(shell_quote "$PI_CREW_AGENT_DIR") $LAUNCH"
 fi
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")

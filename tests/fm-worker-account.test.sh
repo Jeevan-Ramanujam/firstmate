@@ -99,9 +99,10 @@ spawn_ship() {
   shift
   fm_test_spawn_brief "$HOME_DIR" "$id"
   signed_in_claude_root "$CASE/ambient-claude"
+  mkdir -p "$CASE/invoker-pi"
   : > "$CASE/launch.log"
   FM_FAKE_LAUNCH_LOG="$CASE/launch.log" FM_TEST_CLAUDE_CONFIG_DIR="$CASE/ambient-claude" \
-    ANTHROPIC_API_KEY=ambient-invoker-key \
+    ANTHROPIC_API_KEY=ambient-invoker-key PI_CODING_AGENT_DIR="$CASE/invoker-pi" \
     fm_test_run_spawn "$HOME_DIR" "$WT" "$FAKEBIN" "$id" "$PROJ" --mode no-mistakes --yolo off "$@"
 }
 
@@ -142,9 +143,9 @@ test_absent_pin_keeps_the_launch_unchanged() {
   expect_code 0 "$rc" "an unpinned Pi spawn with an unqualified model should succeed: $out"
   assert_not_contains "$(cat "$CASE/launch.log")" "--provider" "an unpinned Pi launch must not add a provider"
   run_pane
-  assert_grep "PI_CODING_AGENT_DIR=$CASE/ambient-pi" "$CASE/pi-worker" \
-    "an unpinned Pi launch must keep the pane's own Pi root"
-  pass "an absent pin leaves Claude and Pi launches exactly as they were"
+  assert_grep "PI_CODING_AGENT_DIR=$HOME_DIR/state/acct-absent-pi.pi-agent" "$CASE/pi-worker" \
+    "an unpinned Pi launch must run under the task-scoped runtime root"
+  pass "an absent pin leaves Claude unchanged and gives Pi workers a task-scoped runtime root"
 }
 
 test_claude_pin_selects_the_root_and_sheds_ambient_credentials() {
@@ -248,10 +249,10 @@ test_pi_pin_selects_the_root_and_the_declared_provider() {
   assert_contains "$launch" "--provider 'openai-codex' --model 'openai-codex/gpt-5.5'" \
     "the launch should confine Pi's model lookup to the declared provider"
   run_pane
-  assert_grep "PI_CODING_AGENT_DIR=$CASE/pi-work" "$CASE/pi-worker" "the worker should run under the pinned Pi root"
+  assert_grep "PI_CODING_AGENT_DIR=$HOME_DIR/state/$id.pi-agent" "$CASE/pi-worker" "the worker should run under the task-scoped Pi runtime root"
   assert_grep "--provider openai-codex --model openai-codex/gpt-5.5" "$CASE/pi-worker" \
     "the worker should receive the declared provider"
-  pass "a Pi pin selects its root and passes the declared provider"
+  pass "a Pi pin selects its source root and provider while workers run under a task-scoped runtime root"
 }
 
 test_pi_pin_refusals() {
@@ -299,6 +300,46 @@ test_pi_extension_provider_and_old_pi_fall_back_to_the_model_listing() {
   out=$(spawn_ship "$id-old" --model openai-codex/gpt-5); rc=$?
   expect_code 0 "$rc" "a Pi without auth check should launch when the root lists the provider: $out"
   pass "extension providers and a Pi without auth check fall back to an exact model-listing match"
+}
+
+test_pi_task_scoped_runtime_root_copies_auth_and_overlays_models() {
+  local out rc id=acct-pi-overlay models
+  new_case pi-overlay pi
+  cat > "$CASE/invoker-pi/auth.json" <<'JSON'
+{"refreshToken":"synthetic-refresh-token"}
+JSON
+  cat > "$CASE/invoker-pi/models.json" <<'JSON'
+{
+  "providers": {
+    "github-copilot": {
+      "modelOverrides": {
+        "gpt-6-luna": { "contextWindow": 128000 },
+        "preserve-me": { "contextWindow": 64000 }
+      }
+    }
+  },
+  "custom": {
+    "marker": "keep"
+  }
+}
+JSON
+
+  out=$(spawn_ship "$id" --model gpt-5.5); rc=$?
+  expect_code 0 "$rc" "a Pi worker launch should succeed with an invoker source root: $out"
+  [ -f "$HOME_DIR/state/$id.pi-agent/auth.json" ] || fail "the task-scoped Pi runtime root did not receive auth.json"
+  cmp -s "$CASE/invoker-pi/auth.json" "$HOME_DIR/state/$id.pi-agent/auth.json" \
+    || fail "auth.json should copy byte-for-byte into the task-scoped Pi runtime root"
+  cmp -s "$CASE/invoker-pi/models.json" "$HOME_DIR/state/$id.pi-agent/models.json" \
+    && fail "the task-scoped models.json must be overlaid, not copied unchanged"
+  assert_grep '"marker":"keep"' "$HOME_DIR/state/$id.pi-agent/models.json" \
+    "the overlaid models.json must retain unrelated source fields"
+  assert_grep '"preserve-me":{"contextWindow":64000}' "$HOME_DIR/state/$id.pi-agent/models.json" \
+    "the overlaid models.json must retain unrelated model overrides"
+  for models in gpt-6-luna gpt-5.3-codex gemini-3.8-flash claude-sonnet-5.5 grok-4.7 gpt-6.1-sol; do
+    assert_grep "\"$models\":{\"contextWindow\":272000" "$HOME_DIR/state/$id.pi-agent/models.json" \
+      "the task-scoped models.json must pin $models to the default cap"
+  done
+  pass "Pi workers use a task-scoped runtime root with copied auth and a context-window overlay"
 }
 
 test_a_pin_governs_only_its_own_runner() {
@@ -392,6 +433,7 @@ test_malformed_pins_refuse_before_launch
 test_pi_pin_selects_the_root_and_the_declared_provider
 test_pi_pin_refusals
 test_pi_extension_provider_and_old_pi_fall_back_to_the_model_listing
+test_pi_task_scoped_runtime_root_copies_auth_and_overlays_models
 test_a_pin_governs_only_its_own_runner
 test_raw_claude_command_receives_the_pin
 test_raw_claude_account_override_refuses_under_a_pin
