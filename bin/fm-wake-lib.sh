@@ -57,12 +57,35 @@ else
   fm_epoch_seconds_to() { printf -v "$1" '%s' "$(date +%s)"; }
 fi
 
+fm_msys_pid_from_winpid() {  # <winpid>
+  local winpid=$1 proc_root d candidate
+  proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
+  case "$winpid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_FM_UNAME" in
+    MSYS*|MINGW*|CYGWIN*) ;;
+    *) return 1 ;;
+  esac
+  for d in "$proc_root"/[0-9]*; do
+    [ -d "$d" ] || continue
+    [ -r "$d/winpid" ] || continue
+    candidate=$(tr -d '[:space:]' < "$d/winpid" 2>/dev/null || true)
+    [ "$candidate" = "$winpid" ] || continue
+    printf '%s\n' "${d##*/}"
+    return 0
+  done
+  return 1
+}
+
 fm_pid_alive() {
-  local pid=$1
+  local pid=$1 mapped
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  mapped=$(fm_msys_pid_from_winpid "$pid") || return 1
+  kill -0 "$mapped" 2>/dev/null
 }
 
 fm_pid_identity() {
