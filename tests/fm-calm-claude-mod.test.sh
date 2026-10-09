@@ -24,6 +24,7 @@ set -u
 MOD="$ROOT/.claude/mods/firstmate-calm"
 PI_SHIP="$ROOT/.pi/extensions/lib/fm-calm-working-ship.ts"
 PI_SPRITE="$ROOT/.pi/extensions/lib/fm-calm-working-ship-sprite.ts"
+PI_PRESERVATION="$ROOT/.pi/extensions/lib/fm-calm-preservation.ts"
 OPERATIONAL_INPUT="$ROOT/bin/fm-operational-input.sh"
 TMP_ROOT=$(fm_test_tmproot fm-calm-claude-mod)
 
@@ -68,6 +69,20 @@ console.log("reexport-ok");
 JS
   out=$(run_node "$TMP_ROOT/sprite-reexport.mjs" 2>&1) || fail "sprite re-export: $out"
   assert_contains "$out" "reexport-ok" "the sprite re-export check did not complete"
+  cat >"$TMP_ROOT/preservation-reexport.mjs" <<JS
+import { pathToFileURL } from "node:url";
+const pi = await import(pathToFileURL(${PI_PRESERVATION@Q}).href);
+const core = await import(pathToFileURL(${MOD@Q} + "/lib/fm-calm-preservation.ts").href);
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+const piKeys = Object.keys(pi).sort();
+const coreKeys = Object.keys(core).sort();
+check(JSON.stringify(piKeys) === JSON.stringify(coreKeys), `the Pi preservation module exports ${piKeys.join(", ")}, not the shared core's ${coreKeys.join(", ")}`);
+check(pi.calmTextIsSubstantive === core.calmTextIsSubstantive, "the Pi preservation module is a separate copy of the shared core, not a re-export of it");
+check(pi.CALM_PRESERVE_MIN_CHARS === core.CALM_PRESERVE_MIN_CHARS, "the Pi preservation module exposes a different minimum length threshold");
+console.log("preservation-reexport-ok");
+JS
+  out=$(run_node "$TMP_ROOT/preservation-reexport.mjs" 2>&1) || fail "preservation re-export: $out"
+  assert_contains "$out" "preservation-reexport-ok" "the preservation re-export check did not complete"
   cat >"$TMP_ROOT/shape.mjs" <<JS
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 const mod = $(js_string "$MOD");
@@ -91,7 +106,7 @@ console.log("shape-ok");
 JS
   out=$(run_node "$TMP_ROOT/shape.mjs" 2>&1) || fail "plugin shape: $out"
   assert_contains "$out" "shape-ok" "plugin shape check did not complete"
-  pass "the Calm mod is one hooks module, linked into the project's auto-load path, with no command, skill, agent, or classic hook path that bypasses its exact opt-in, and the Pi sprite re-export shares the same function identity as the mod's canonical core"
+  pass "the Calm mod is one hooks module, linked into the project's auto-load path, with no command, skill, agent, or classic hook path that bypasses its exact opt-in, and the Pi sprite/preservation re-exports share the same function identity as the mod's canonical cores"
 }
 
 test_shared_sprite_and_pi_rendering() {
