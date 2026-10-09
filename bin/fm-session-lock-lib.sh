@@ -35,6 +35,86 @@ FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$|^omp$'
 # bin/fm-claude-stop-autoarm.sh.
 FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi omp)
 
+_FM_SESSION_LOCK_UNAME=${FM_SESSION_LOCK_UNAME_OVERRIDE:-$(uname 2>/dev/null || echo unknown)}
+_FM_SESSION_LOCK_PROC_ROOT=${FM_SESSION_LOCK_PROC_ROOT:-${FM_PROC_ROOT_OVERRIDE:-/proc}}
+
+fm_session_lock_msys_like() {
+  case "$_FM_SESSION_LOCK_UNAME" in
+    MSYS*|MINGW*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_session_lock_pid_external() {  # <walk-pid>
+  local pid=$1 winpid
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if fm_session_lock_msys_like && [ -r "$_FM_SESSION_LOCK_PROC_ROOT/$pid/winpid" ]; then
+    winpid=$(tr -d '[:space:]' < "$_FM_SESSION_LOCK_PROC_ROOT/$pid/winpid" 2>/dev/null || true)
+    case "$winpid" in
+      ''|*[!0-9]*|0) ;;
+      *) printf '%s\n' "$winpid"; return 0 ;;
+    esac
+  fi
+  printf '%s\n' "$pid"
+}
+
+fm_session_lock_pid_walk() {  # <recorded-pid>
+  local pid=$1 d candidate
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -d "$_FM_SESSION_LOCK_PROC_ROOT/$pid" ] && { printf '%s\n' "$pid"; return 0; }
+  fm_session_lock_msys_like || { printf '%s\n' "$pid"; return 0; }
+  for d in "$_FM_SESSION_LOCK_PROC_ROOT"/[0-9]*; do
+    [ -d "$d" ] || continue
+    [ -r "$d/winpid" ] || continue
+    candidate=$(tr -d '[:space:]' < "$d/winpid" 2>/dev/null || true)
+    [ "$candidate" = "$pid" ] || continue
+    printf '%s\n' "${d##*/}"
+    return 0
+  done
+  printf '%s\n' "$pid"
+}
+
+fm_session_lock_pid_alive() {  # <recorded-pid>
+  local walk
+  walk=$(fm_session_lock_pid_walk "$1") || return 1
+  kill -0 "$walk" 2>/dev/null
+}
+
+fm_session_lock_process_comm() {  # <walk-pid> <proc-dir>
+  local pid=$1 proc=$2 cmdline argv0
+  if fm_session_lock_msys_like && [ -r "$proc/cmdline" ]; then
+    cmdline=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
+    [ -n "$cmdline" ] || return 1
+    argv0=${cmdline%% *}
+    [ -n "$argv0" ] || return 1
+    printf '%s\n' "$argv0"
+    return 0
+  fi
+  ps -o comm= -p "$pid" 2>/dev/null
+}
+
+fm_session_lock_process_args() {  # <walk-pid> <proc-dir>
+  local pid=$1 proc=$2 cmdline
+  if fm_session_lock_msys_like && [ -r "$proc/cmdline" ]; then
+    cmdline=$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)
+    [ -n "$cmdline" ] || return 1
+    printf '%s\n' "$cmdline"
+    return 0
+  fi
+  ps -o args= -p "$pid" 2>/dev/null
+}
+
+fm_session_lock_process_ppid() {  # <walk-pid> <proc-dir>
+  local pid=$1 proc=$2 ppid
+  if fm_session_lock_msys_like && [ -r "$proc/ppid" ]; then
+    ppid=$(tr -d '[:space:]' < "$proc/ppid" 2>/dev/null || true)
+    case "$ppid" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$ppid"
+    return 0
+  fi
+  ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '
+}
+
 # Print the exact harness name carried by executable path $1 - its own basename
 # or any directory component - or return 1.
 #
@@ -117,19 +197,21 @@ fm_harness_process_matches() {  # <comm> <args>
 # session cannot be read off the ancestry at all, so the whole contiguous run is
 # reported and the callers below decide what they need from it.
 fm_harness_ancestry_pids() {
-  local pid=$$ comm args extending=0 printed=0
+  local pid=$$ walk_pid proc comm args extending=0 printed=0
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    walk_pid=$(fm_session_lock_pid_walk "$pid") || break
+    proc="$_FM_SESSION_LOCK_PROC_ROOT/$walk_pid"
+    comm=$(fm_session_lock_process_comm "$walk_pid" "$proc") || break
+    args=$(fm_session_lock_process_args "$walk_pid" "$proc" || true)
     if fm_harness_process_matches "$comm" "$args"; then
-      printf '%s\n' "$pid"
+      fm_session_lock_pid_external "$walk_pid" || break
       printed=1
       [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || break
       extending=1
     elif [ "$extending" -eq 1 ]; then
       break
     fi
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    pid=$(fm_session_lock_process_ppid "$walk_pid" "$proc") || break
     # Examine the top of the chain before stopping. Inside a PID namespace the
     # harness itself is pid 1, so stopping as soon as the next pid is 1 hides the
     # very process this walk exists to find. A host's real pid 1 (init, systemd,
@@ -165,10 +247,12 @@ EOF
 
 # True if $1 is a live process that looks like a verified harness.
 fm_harness_pid_alive() {
-  local pid=$1 comm args
-  kill -0 "$pid" 2>/dev/null || return 1
-  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  local pid=$1 walk proc comm args
+  fm_session_lock_pid_alive "$pid" || return 1
+  walk=$(fm_session_lock_pid_walk "$pid") || return 1
+  proc="$_FM_SESSION_LOCK_PROC_ROOT/$walk"
+  comm=$(fm_session_lock_process_comm "$walk" "$proc") || return 1
+  args=$(fm_session_lock_process_args "$walk" "$proc" || true)
   fm_harness_process_matches "$comm" "$args"
 }
 
@@ -199,17 +283,22 @@ fm_harness_pid_alive() {
 # ancestry list an earlier walk already produced, so a caller that walked once
 # need not walk again.
 fm_session_lock_trusted_session_id() {  # [<ancestry-pids>]
-  local id=${CLAUDE_CODE_SESSION_ID:-} claude_pid=${CLAUDE_PID:-} pids=${1:-} pid comm args
+  local id=${CLAUDE_CODE_SESSION_ID:-} claude_pid=${CLAUDE_PID:-} pids=${1:-} pid walk proc comm args
   [ -n "$id" ] || return 1
   case "$id" in *$'\n'*|*$'\r'*) return 1 ;; esac
   case "$claude_pid" in ''|*[!0-9]*) return 1 ;; esac
+  if walk=$(fm_session_lock_pid_walk "$claude_pid"); then
+    claude_pid=$(fm_session_lock_pid_external "$walk" 2>/dev/null || printf '%s' "$claude_pid")
+  fi
   if [ -z "$pids" ]; then
     pids=$(fm_harness_ancestry_pids) || return 1
   fi
   while IFS= read -r pid; do
     [ "$pid" = "$claude_pid" ] || continue
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    walk=$(fm_session_lock_pid_walk "$pid") || return 1
+    proc="$_FM_SESSION_LOCK_PROC_ROOT/$walk"
+    comm=$(fm_session_lock_process_comm "$walk" "$proc") || return 1
+    args=$(fm_session_lock_process_args "$walk" "$proc" || true)
     fm_harness_process_matches "$comm" "$args" || return 1
     [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] || return 1
     printf '%s\n' "$id"
@@ -252,10 +341,14 @@ fm_session_lock_same_session() {  # <state> [<ancestry-pids>]
 # the sidecar still names that session. Every other session records the
 # outermost pid of its contiguous run, exactly as before.
 fm_session_lock_anchor_pid() {
-  local pids
+  local pids walk
   pids=$(fm_harness_ancestry_pids) || return 1
   if fm_session_lock_trusted_session_id "$pids" >/dev/null; then
-    printf '%s\n' "$CLAUDE_PID"
+    if walk=$(fm_session_lock_pid_walk "$CLAUDE_PID"); then
+      fm_session_lock_pid_external "$walk"
+    else
+      printf '%s\n' "$CLAUDE_PID"
+    fi
     return 0
   fi
   _fm_harness_outermost_pid "$pids"
@@ -366,18 +459,14 @@ fm_session_lock_inspect() {  # <state>
       return 0
       ;;
   esac
-  if kill -0 "$pid" 2>/dev/null; then
-    if fm_harness_pid_alive "$pid"; then
-      FM_LOCK_INSPECT_STATE=held
-      FM_LOCK_INSPECT_LIVE_HARNESS=true
-    else
-      FM_LOCK_INSPECT_STATE=unknown
-      FM_LOCK_INSPECT_LIVE_HARNESS=false
-    fi
+  if fm_harness_pid_alive "$pid"; then
+    FM_LOCK_INSPECT_STATE=held
+    FM_LOCK_INSPECT_LIVE_HARNESS=true
     return 0
   fi
-  if ps -o comm= -p "$pid" >/dev/null 2>&1; then
+  if fm_session_lock_pid_alive "$pid"; then
     FM_LOCK_INSPECT_STATE=unknown
+    FM_LOCK_INSPECT_LIVE_HARNESS=false
     return 0
   fi
   # shellcheck disable=SC2034 # Output global, read by lock status and inbox ready.
