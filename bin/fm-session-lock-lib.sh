@@ -178,6 +178,32 @@ fm_harness_process_matches() {  # <comm> <args>
   return 1
 }
 
+# MSYS2/Cygwin: Pi's tool shells are detached (PPID=1), so the ancestry walk never
+# reaches the Pi node process. When Pi env proof exists, locate the PRIMARY Pi:
+# prefer the process whose Windows pid the primary's watch extension recorded
+# (line 2 of state/.pi-watch-extension-loaded), else the sole launcher-less
+# (no --model) candidate. Ambiguity fails closed rather than picking a crewmate.
+_fm_msys_pi_fallback() {
+  case "${OSTYPE:-}" in cygwin*|msys*) ;; *) return 1 ;; esac
+  [ "${PI_CODING_AGENT:-}" = "true" ] || return 1
+  local state marker d pid cmd win cands="" plain="" hit="" n=0
+  state=${FM_STATE_OVERRIDE:-${FM_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/state}
+  marker=$(sed -n '2p' "$state/.pi-watch-extension-loaded" 2>/dev/null || true)
+  for d in "$_FM_SESSION_LOCK_PROC_ROOT"/[0-9]*; do
+    pid=${d##*/}
+    [ "$pid" != "$$" ] || continue
+    cmd=$(tr ' ' ' ' < "$d/cmdline" 2>/dev/null) || continue
+    case "$cmd" in *node*pi-coding-agent*) ;; *) continue ;; esac
+    kill -0 "$pid" 2>/dev/null || continue
+    win=$(tr -d '[:space:]' < "$d/winpid" 2>/dev/null || true)
+    [ -n "$marker" ] && [ "$win" = "$marker" ] && hit=$pid
+    case "$cmd" in *" --model "*|*" -e "*) ;; *) plain="$plain $pid"; n=$((n + 1)) ;; esac
+  done
+  if [ -n "$hit" ]; then fm_session_lock_pid_external "$hit"; return; fi
+  if [ "$n" -eq 1 ]; then fm_session_lock_pid_external "${plain# }"; return; fi
+  return 1
+}
+
 # Walk the current process ancestry (up to 16 hops) and print this session's
 # contiguous verified-harness ancestry, innermost pid first.
 #
@@ -219,7 +245,8 @@ fm_harness_ancestry_pids() {
     case "$pid" in '' | *[!0-9]*) break ;; esac
     [ "$pid" -ge 1 ] || break
   done
-  [ "$printed" -eq 1 ]
+  [ "$printed" -eq 1 ] && return 0
+  _fm_msys_pi_fallback
 }
 
 # Print the outermost pid of this session's contiguous harness run for callers
