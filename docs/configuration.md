@@ -90,6 +90,7 @@ Each effective `FM_HOME` contains private operational directories.
 - One-shot Bearings reconcile requests under `state/reconcile-notify/`.
 - Private secondmate config-reread generations with their retry and quarantine state.
 - Per-task steering-inbox records under `state/<id>.inbox/` (`bin/fm-task-inbox-lib.sh`).
+- Per-task Pi ship/scout runtime roots under `state/<id>.pi-agent/` (`bin/fm-spawn.sh`).
 - Parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 
 `config/` holds local gitignored operating choices, including explicit extension bindings under `config/extensions.d/`.
@@ -978,6 +979,22 @@ Both files are local and gitignored.
 | --- | --- | --- | --- |
 | `claude` | `config/claude-account` | `CLAUDE_CONFIG_DIR` | the variable unset, so Claude uses its default login |
 | `pi`, `pi-signed` | `config/pi-account` | `PI_CODING_AGENT_DIR` | `~/.pi/agent` |
+
+### Pi ship and scout runtime root
+
+Every Pi and pi-signed ship or scout launch, including relaunch, runs under a firstmate-owned per-task runtime root at `state/<task-id>.pi-agent`.
+The launch always receives `PI_CODING_AGENT_DIR=<that path>` for those workers only.
+Pi secondmate launches are unchanged and keep their existing account-root behavior.
+
+Before launch, `bin/fm-spawn.sh` refreshes that per-task root idempotently from the selected source root.
+When `config/pi-account` is present, the source is the pinned root.
+Without that pin, the source is `PI_CODING_AGENT_DIR` from firstmate's own environment when set, otherwise `~/.pi/agent`.
+
+The refresh copies `auth.json`, `trust.json`, and model cache/runtime files when present, then writes a `models.json` overlay that sets `providers.github-copilot.modelOverrides.<model>.contextWindow` for these worker models: `gpt-6-luna`, `gpt-5.3-codex`, `gemini-3.8-flash`, `claude-sonnet-5.5`, `grok-4.7`, and `gpt-6.1-sol`.
+This value drives Pi compaction threshold behavior and is not a hard provider context cap.
+
+The cap is controlled by `FM_PI_CREW_CONTEXT_WINDOW_CAP`, default `272000`.
+Changing that variable affects future Pi ship and scout launches from this home.
 
 ### File format and provider selection
 
