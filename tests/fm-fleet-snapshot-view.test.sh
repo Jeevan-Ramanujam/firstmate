@@ -377,6 +377,52 @@ EOF
   pass "main_inventory discloses orphan/unstructured and clears when inventory is consistent"
 }
 
+# Regression for jq's own "Argument list too long": a large backlog and a
+# single pathologically long status line must never ride on jq's CLI argv
+# (bin/fm-fleet-snapshot.sh's main_inventory_json, status_event_json,
+# crew_state_json, and task_json_lines all transport such content through
+# files with --slurpfile/--rawfile instead).
+test_large_corpus_and_long_status_line_avoid_argv_limit() {
+  local home fakebin out i status_len raw_len
+  home=$(make_home large-corpus)
+  mkdir -p "$home/projects/big-worktree"
+  {
+    printf '## In flight\n'
+    printf -- '- [ ] big-status-task - Big Status Task (repo: alpha) (kind: ship)\n'
+    printf '\n## Queued\n\n## Done\n'
+    i=1
+    while [ "$i" -le 3000 ]; do
+      printf -- '- [x] done-task-%s - Done task number %s with a descriptive title (repo: alpha) (kind: ship) (merged 2026-07-0%s)\n' \
+        "$i" "$i" "$((i % 9 + 1))"
+      i=$((i + 1))
+    done
+  } > "$home/data/backlog.md"
+  fm_write_meta "$home/state/big-status-task.meta" \
+    "window=firstmate:fm-big-status-task" \
+    "worktree=$home/projects/big-worktree" \
+    "project=alpha" \
+    "harness=claude" \
+    "kind=ship" \
+    "mode=ship"
+  # A single status line far past any OS argv-length limit if it were ever
+  # placed on a jq command line directly.
+  awk 'BEGIN { printf "working: "; for (i = 0; i < 60000; i++) printf "x"; printf "\n" }' \
+    > "$home/state/big-status-task.status"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json) \
+    || fail "snapshot failed against a large backlog and an oversized status line"
+  printf '%s' "$out" | jq -e . >/dev/null || fail "large-corpus snapshot must be valid JSON"
+  printf '%s' "$out" | jq -e '
+    .main_inventory.valid == true
+      and ([.backlog.records[] | select(.state == "done")] | length) == 3000
+  ' >/dev/null || fail "large-corpus snapshot lost backlog rows: main_inventory or done count wrong"
+  status_len=$(printf '%s' "$out" | jq -r '.tasks[0].hints.last_event_text | length')
+  raw_len=$(printf '%s' "$out" | jq -r '.tasks[0].paths.status_log.last_event.raw | length')
+  [ "$status_len" -eq 60009 ] || fail "oversized status line was not preserved intact in hints.last_event_text (got $status_len)"
+  [ "$raw_len" -eq 60009 ] || fail "oversized status line was not preserved intact in paths.status_log.last_event.raw (got $raw_len)"
+  pass "a large backlog and a single oversized status line never blow jq's argv limit and content is preserved intact"
+}
+
 test_normalized_roles_and_plural_blocker_readiness() {
   local home fakebin out
   home=$(make_home normalized-records)
@@ -1158,6 +1204,7 @@ test_home_summary_excludes_secondmate_from_child_inventory
 test_undated_captain_hold_phrasing_and_aging
 test_hold_buckets_are_total_and_text_blind
 test_main_inventory_orphan_and_unstructured_disclosure
+test_large_corpus_and_long_status_line_avoid_argv_limit
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state
 test_open_decision_survives_later_unrelated_event
