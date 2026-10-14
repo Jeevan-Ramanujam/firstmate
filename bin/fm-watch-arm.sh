@@ -131,7 +131,7 @@ GRACE=${FM_GUARD_GRACE:-300}
 # Git Bash/MSYS pays a much higher fork cost while the watcher completes its
 # required pre-lock migration, so its bounded default covers that cold start.
 case "${OSTYPE:-}" in
-  msys*|mingw*|cygwin*) ARM_CONFIRM_DEFAULT=30 ;;
+  msys*|mingw*|cygwin*) ARM_CONFIRM_DEFAULT=180 ;;
   *) ARM_CONFIRM_DEFAULT=10 ;;
 esac
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-$ARM_CONFIRM_DEFAULT}
