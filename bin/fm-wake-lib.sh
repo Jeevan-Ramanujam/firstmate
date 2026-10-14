@@ -16,6 +16,12 @@ FM_LOCK_STALE_AFTER="${FM_LOCK_STALE_AFTER:-2}"
 # confirm and 0.5s attach polls, and forking uname per call is a measurable cost on
 # the platform (Git Bash/MSYS) that already pays the highest fork price.
 _FM_UNAME=$(uname 2>/dev/null || echo unknown)
+# MSYS2/Cygwin: default symlink mode silently creates directory copies instead
+# of real symlinks, breaking the ln-s-based lock protocol.  winsymlinks:lnk uses
+# .lnk shortcut files that MSYS2 exposes as proper POSIX symlinks.
+case "${OSTYPE:-}" in cygwin*|msys*)
+  export MSYS="${MSYS:+$MSYS }winsymlinks:lnk"
+esac
 mkdir -p "$STATE"
 
 # Most wake-library consumers need only queue and lock primitives, including
@@ -57,12 +63,35 @@ else
   fm_epoch_seconds_to() { printf -v "$1" '%s' "$(date +%s)"; }
 fi
 
+fm_msys_pid_from_winpid() {  # <winpid>
+  local winpid=$1 proc_root d candidate
+  proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
+  case "$winpid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_FM_UNAME" in
+    MSYS*|MINGW*|CYGWIN*) ;;
+    *) return 1 ;;
+  esac
+  for d in "$proc_root"/[0-9]*; do
+    [ -d "$d" ] || continue
+    [ -r "$d/winpid" ] || continue
+    candidate=$(tr -d '[:space:]' < "$d/winpid" 2>/dev/null || true)
+    [ "$candidate" = "$winpid" ] || continue
+    printf '%s\n' "${d##*/}"
+    return 0
+  done
+  return 1
+}
+
 fm_pid_alive() {
-  local pid=$1
+  local pid=$1 mapped
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  if kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  mapped=$(fm_msys_pid_from_winpid "$pid") || return 1
+  kill -0 "$mapped" 2>/dev/null
 }
 
 fm_pid_identity() {
