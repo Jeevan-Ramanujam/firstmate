@@ -192,7 +192,7 @@ _fm_msys_pi_fallback() {
   for d in "$_FM_SESSION_LOCK_PROC_ROOT"/[0-9]*; do
     pid=${d##*/}
     [ "$pid" != "$$" ] || continue
-    cmd=$(tr ' ' ' ' < "$d/cmdline" 2>/dev/null) || continue
+    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
     case "$cmd" in *node*pi-coding-agent*) ;; *) continue ;; esac
     kill -0 "$pid" 2>/dev/null || continue
     win=$(tr -d '[:space:]' < "$d/winpid" 2>/dev/null || true)
