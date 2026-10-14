@@ -44,7 +44,8 @@ lib_eval() {  # <fakebin> <expression>
   local -a session_env=()
   [ -z "${FM_TEST_SESSION_ID:-}" ] || session_env+=("CLAUDE_CODE_SESSION_ID=$FM_TEST_SESSION_ID")
   [ -z "${FM_TEST_CLAUDE_PID:-}" ] || session_env+=("CLAUDE_PID=$FM_TEST_CLAUDE_PID")
-  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID ${session_env[@]+"${session_env[@]}"} \
+  [ -z "${FM_TEST_PI_CODING_AGENT:-}" ] || session_env+=("PI_CODING_AGENT=$FM_TEST_PI_CODING_AGENT")
+  env -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PID -u PI_CODING_AGENT ${session_env[@]+"${session_env[@]}"} \
     PATH="$fakebin:$PATH" bash -c "
     : \"\${FM_SESSION_LOCK_UNAME_OVERRIDE:=Linux}\"
     . \"\$0\"
@@ -351,6 +352,91 @@ SH
     lib_eval "$fakebin" 'fm_harness_pid_alive 1900' \
     || fail "WINPID liveness did not resolve through its mapped walk pid"
   pass "session-lock: harness liveness resolves WINPID to the mapped walk pid on msys"
+}
+
+write_msys_fallback_ps() {  # <fakebin>
+  cat > "$1/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+field= pid=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) field=$2; shift 2 ;;
+    -p) pid=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$field" in
+  comm=) printf '%s\n' bash ;;
+  args=) printf '%s\n' 'bash tests/fm-session-lock-ancestry.test.sh' ;;
+  ppid=) printf '%s\n' 1 ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$1/ps"
+}
+
+test_msys_fallback_prefers_primary_marker_winpid() {
+  local dir fakebin proc got
+  dir="$TMP_ROOT/msys-fallback-marker"
+  fakebin=$(fm_fakebin "$dir")
+  proc="$dir/proc"
+  mkdir -p "$dir/state" "$proc/700" "$proc/701"
+  write_msys_fallback_ps "$fakebin"
+  printf 'x\n2202\n' > "$dir/state/.pi-watch-extension-loaded"
+  printf '1101\n' > "$proc/700/winpid"
+  printf '2202\n' > "$proc/701/winpid"
+  printf 'node\0pi-coding-agent\0--model\0xhigh\0' > "$proc/700/cmdline"
+  printf 'node\0pi-coding-agent\0--model\0xhigh\0' > "$proc/701/cmdline"
+
+  got=$(FM_TEST_PI_CODING_AGENT=true FM_STATE_OVERRIDE="$dir/state" \
+    FM_SESSION_LOCK_UNAME_OVERRIDE=MSYS_NT-10.0 FM_SESSION_LOCK_PROC_ROOT="$proc" \
+    lib_eval "$fakebin" 'fm_harness_ancestry_pid') \
+    || fail "msys fallback did not resolve the marker-matched primary"
+  [ "$got" = 2202 ] || fail "msys fallback resolved '$got', expected marker WINPID 2202"
+  pass "session-lock: msys fallback prefers the primary Pi recorded by winpid marker"
+}
+
+test_msys_fallback_uses_sole_launcherless_candidate() {
+  local dir fakebin proc got
+  dir="$TMP_ROOT/msys-fallback-sole"
+  fakebin=$(fm_fakebin "$dir")
+  proc="$dir/proc"
+  mkdir -p "$dir/state" "$proc/710" "$proc/711"
+  write_msys_fallback_ps "$fakebin"
+  printf 'x\n9999\n' > "$dir/state/.pi-watch-extension-loaded"
+  printf '3310\n' > "$proc/710/winpid"
+  printf '3311\n' > "$proc/711/winpid"
+  printf 'node\0pi-coding-agent\0--model\0xhigh\0' > "$proc/710/cmdline"
+  printf 'node\0pi-coding-agent\0' > "$proc/711/cmdline"
+
+  got=$(FM_TEST_PI_CODING_AGENT=true FM_STATE_OVERRIDE="$dir/state" \
+    FM_SESSION_LOCK_UNAME_OVERRIDE=MSYS_NT-10.0 FM_SESSION_LOCK_PROC_ROOT="$proc" \
+    lib_eval "$fakebin" 'fm_harness_ancestry_pid') \
+    || fail "msys fallback did not resolve the sole launcher-less candidate"
+  [ "$got" = 3311 ] || fail "msys fallback resolved '$got', expected sole launcher-less WINPID 3311"
+  pass "session-lock: msys fallback uses the sole launcher-less Pi candidate"
+}
+
+test_msys_fallback_ambiguous_launcherless_candidates_fail_closed() {
+  local dir fakebin proc
+  dir="$TMP_ROOT/msys-fallback-ambiguous"
+  fakebin=$(fm_fakebin "$dir")
+  proc="$dir/proc"
+  mkdir -p "$dir/state" "$proc/720" "$proc/721"
+  write_msys_fallback_ps "$fakebin"
+  printf 'x\n9999\n' > "$dir/state/.pi-watch-extension-loaded"
+  printf '4420\n' > "$proc/720/winpid"
+  printf '4421\n' > "$proc/721/winpid"
+  printf 'node\0pi-coding-agent\0' > "$proc/720/cmdline"
+  printf 'node\0pi-coding-agent\0' > "$proc/721/cmdline"
+
+  if FM_TEST_PI_CODING_AGENT=true FM_STATE_OVERRIDE="$dir/state" \
+    FM_SESSION_LOCK_UNAME_OVERRIDE=MSYS_NT-10.0 FM_SESSION_LOCK_PROC_ROOT="$proc" \
+    lib_eval "$fakebin" 'fm_harness_ancestry_pid' >/dev/null 2>&1; then
+    fail "msys fallback selected one launcher-less candidate from an ambiguous set"
+  fi
+  pass "session-lock: msys fallback fails closed when launcher-less candidates are ambiguous"
 }
 
 # A background Claude session's process table. The hook fires inside
@@ -1186,6 +1272,9 @@ test_harness_beyond_a_gap_never_owns_the_lock
 test_competing_version_named_session_is_seen_as_live
 test_msys_ancestry_reports_winpid_for_lock_namespace
 test_msys_winpid_liveness_maps_to_walk_pid
+test_msys_fallback_prefers_primary_marker_winpid
+test_msys_fallback_uses_sole_launcherless_candidate
+test_msys_fallback_ambiguous_launcherless_candidates_fail_closed
 test_same_session_id_owns_a_recycled_background_chain
 test_anchor_pid_is_the_model_loop_process_only_for_a_trusted_id
 test_e2e_version_named_session_claims_the_home
